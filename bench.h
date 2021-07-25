@@ -57,9 +57,9 @@ void report_times()
 
 #define BENCH_MAIN_INIT(init, run_one) \
     int main(int argc, char **argv) { \
+        init \
         redirect_stdout(); \
         setaffinity(3); \
-        init \
         for (int i = 0; i < ITERS; i++) { \
             struct timespec start, end; \
             clock_gettime(CLOCK_MONOTONIC, &start); \

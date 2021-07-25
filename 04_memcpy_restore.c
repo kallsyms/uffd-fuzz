@@ -1,9 +1,13 @@
 #include "bench.h"
 
 #include <string.h>  // memcpy
+#include <linux/userfaultfd.h>
+#include <sys/ioctl.h>  // ioctl
 
 #include "target.h"
+#include "pmparser.h"
 
+#define __NR_userfaultfd 323  // this is wrong in asm-generic??
 #define PAGE_SIZE 4096
 
 typedef struct {
@@ -16,15 +20,44 @@ size_t n_pages = 0;
 
 void find_regions()
 {
-    /*
-     * basic idea:
-     *   install a kprobe on kernels COW handler that gets the address being overwritten
-     *   fork and run the target
-     *   get the kprobe hits and save a page_t with the addr and data before changes for each hit
-     * then later, we can fork, run the target, then use the page_t's to restore memory all in userland
-     */
+    int uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
 
-    // TODO: userfaultfd and UFFDIO_REGISTER_MODE_WP?
+    if (uffd < 0) {
+        perror("userfaultfd");
+        exit(1);
+    }
+
+    procmaps_iterator* maps = pmparser_parse(-1);
+
+	if (maps == NULL) {
+        perror("pmparser_parse");
+        exit(1);
+	}
+
+	procmaps_struct* cur_map = NULL;
+
+	while((cur_map = pmparser_next(maps)) != NULL){
+        if (!cur_map->is_w) {
+            continue;
+        }
+
+        // DEBUG
+		pmparser_print(cur_map, 0);
+
+        struct uffdio_register uffdio_register;
+        uffdio_register.range.start = (unsigned long)cur_map->addr_start;
+        uffdio_register.range.len = (unsigned long)cur_map->addr_end - (unsigned long)cur_map->addr_start;
+        uffdio_register.mode = UFFDIO_REGISTER_MODE_WP;
+
+        if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1) {
+            perror("ioctl(UFFDIO_REGISTER)");
+            exit(1);
+        }
+
+		printf("\n~~~~~~~~~~~~~~~~~~~~~~~~~\n");
+	}
+
+	pmparser_free(maps);
 }
 
 void restore_regions()
