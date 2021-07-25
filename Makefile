@@ -5,7 +5,7 @@ all: mini target 01_fork 02_vfork 03_fork_server 04_memcpy_restore
 
 .PHONY: clean
 clean:
-	rm -rf target 01_fork 02_vfork 03_fork_server pmparser.o 04_memcpy_restore.o 04_memcpy_restore
+	rm -rf target 01_fork 02_vfork 03_fork_server pmparser.o 04_memcpy_restore.o 04_memcpy_restore mini mini.o 04_memcpy_restore.o pmparser.o
 
 .PHONY: test
 test: all

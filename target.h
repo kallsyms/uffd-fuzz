@@ -4,7 +4,7 @@
 int target_main()
 {
     void *heap = malloc(0x10);
-    free(heap);
+    printf("heap alloc at %p\n", heap);
     puts("all done!");
 
     return 0;
