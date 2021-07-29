@@ -15,26 +15,26 @@
 #define PAGE_SIZE 4096
 
 // mmap region where our stack can be while we remap, and where our uffd thread can live.
-__attribute__((section(".writesafe"))) uint8_t tmp_stack[0x10000];
+__attribute__((section(".writeignored"))) uint8_t tmp_stack[0x10000];
 
 // old stack to pivot back after everything is remapped
-__attribute__((section(".writesafe"))) uintptr_t old_stack;
+__attribute__((section(".writeignored"))) uintptr_t old_stack;
 
-// marked writesafe so that they don't get pulled out from underneath us in remap()
-__attribute__((section(".writesafe"))) size_t n_maps = 0;
-__attribute__((section(".writesafe"))) procmaps_struct maps[0x100];
+// marked writeignored so that they don't get pulled out from underneath us in remap()
+__attribute__((section(".writeignored"))) size_t n_maps = 0;
+__attribute__((section(".writeignored"))) procmaps_struct maps[0x100];
 
 typedef struct {
     uintptr_t addr;
     uint8_t data[PAGE_SIZE];
 } page_t;
 
-__attribute__((section(".writesafe"))) size_t n_pages = 0;
-__attribute__((section(".writesafe"))) page_t pages[50];
+__attribute__((section(".writeignored"))) size_t n_pages = 0;
+__attribute__((section(".writeignored"))) page_t pages[50];
 
 // stuff so the main thread can wait until UFFD write protecting is done
-__attribute__((section(".writesafe"))) pthread_cond_t uffd_ready = PTHREAD_COND_INITIALIZER;
-__attribute__((section(".writesafe"))) pthread_mutex_t uffd_ready_lock = PTHREAD_MUTEX_INITIALIZER;
+__attribute__((section(".writeignored"))) pthread_cond_t uffd_ready = PTHREAD_COND_INITIALIZER;
+__attribute__((section(".writeignored"))) pthread_mutex_t uffd_ready_lock = PTHREAD_MUTEX_INITIALIZER;
 
 // stubs that remap() needs (since it can't touch libc while it's doing its thing)
 __attribute__((section(".remap"))) void *remap_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
@@ -80,7 +80,7 @@ __attribute__((section(".remap"))) int remap_munmap(void *addr, size_t length)
     return ret;
 }
 
-__attribute__((noinline, section(".remap"))) void remap()
+__attribute__((noinline, section(".remap"))) void _remap()
 {
     for (off_t i = 0; i < n_maps; i++) {
         procmaps_struct *cur_map = &maps[i];
@@ -131,7 +131,7 @@ int load_maps()
     procmaps_struct* cur_map = NULL;
 
     while ((cur_map = pmparser_next(maps_it)) != NULL) {
-        // ignore .remap and .writesafe
+        // ignore .remap and .writeignored
         if (cur_map->addr_start == (void *)0x13370000 || cur_map->addr_start == (void *)0x13380000) {
             continue;
         }
@@ -167,15 +167,13 @@ int load_maps()
     return 0;
 }
 
-void remap_stack_swap()
+void remap()
 {
     asm(
         "leaq tmp_stack, %%rax; addq $0xf000, %%rax; movq %%rsp, old_stack; movq %%rax, %%rsp"
-        : // no out
-        : // no in
-        : "rax");
+        ::: "rax");
 
-    remap();
+    _remap();
 
     asm("movq old_stack, %rsp");
 }
@@ -332,7 +330,7 @@ int uffd_deregister(int uffd)
     return 0;
 }
 
-void restore_pages()
+void _restore_pages()
 {
     const char msg[] = "restoring pages...\n";
     write(2, msg, sizeof(msg));
@@ -343,13 +341,30 @@ void restore_pages()
     }
 }
 
+__attribute__((always_inline)) inline void restore_pages()
+{
+    // need to hop into a safe stack temporarily so the call/ret doesn't get overwritten
+    asm(
+        "leaq tmp_stack, %%rax; addq $0xff00, %%rax; movq %%rsp, old_stack; movq %%rax, %%rsp"
+        ::: "rax");
+
+    printf("See %lu pages:\n", n_pages);
+    for (size_t i = 0; i < n_pages; i++) {
+        printf("  %p\n", (void *)pages[i].addr);
+    }
+
+    _restore_pages();
+
+    asm("movq old_stack, %%rsp" ::: "memory");
+}
+
 int main()
 {
     if (load_maps()) {
         return 1;
     }
 
-    remap_stack_swap();
+    remap();
 
     puts("Hello from the anonymous side");
 
@@ -366,10 +381,11 @@ int main()
 
     puts("Waiting for uffd_monitor_thread");
 
+    // could also like msgsnd/msgrcv?
     pthread_mutex_lock(&uffd_ready_lock);
     pthread_cond_wait(&uffd_ready, &uffd_ready_lock);
 
-    write(2, "Ok here we go\n", 14);
+    puts("Ok here we go");
 
     int *x = malloc(8);
     *x = 1;
@@ -379,21 +395,7 @@ int main()
     printf("malloc at %p = %d\n", x, *x);
     printf("stack at %p = %d\n", &stack, stack);
 
-    printf("See %lu pages:\n", n_pages);
-    for (size_t i = 0; i < n_pages; i++) {
-        printf("  %p\n", (void *)pages[i].addr);
-    }
-
-    // need to hop into a safe stack temporarily so the call/ret doesn't get overwritten
-    asm(
-        "leaq tmp_stack, %%rax; addq $0xff00, %%rax; movq %%rsp, old_stack; movq %%rax, %%rsp"
-        : // no out
-        : // no in
-        : "rax");
-
     restore_pages();
-
-    asm("movq old_stack, %%rsp" ::: "memory");
 
     printf("alloc now %p\n", x);
     printf("stack at %p now %d\n", &stack, stack);
