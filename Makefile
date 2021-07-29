@@ -34,10 +34,10 @@ pmparser.o: pmparser.c
 	$(CC) -O3 -o $@ -c $<
 
 04_memcpy_restore.o: 04_memcpy_restore.c $(DEPS)
-	$(CC) -O3 -o $@ -c $<
+	$(CC) -o $@ -c $<
 
 04_memcpy_restore: 04_memcpy_restore.o pmparser.o
-	$(CC) -O3 -o $@ 04_memcpy_restore.o pmparser.o
+	$(CC) -o $@ -no-pie -Wl,--section-start=.remap=0x13370000,--section-start=.writeignored=0x13380000,--section-start=.got.plt=0x500000,--section-start=.data=0x600000 -pthread -static 04_memcpy_restore.o pmparser.o
 
 remap_anon.o: remap_anon.c $(DEPS)
 	$(CC) -o $@ -c $<

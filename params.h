@@ -4,4 +4,4 @@
 
 #define TARGET "./target"
 #define TARGET_ARGS ((char * const []){"./target", NULL})
-#define ITERS 10
+#define ITERS 1000

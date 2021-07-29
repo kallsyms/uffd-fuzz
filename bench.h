@@ -43,7 +43,7 @@ void setaffinity(int core)
     }
 }
 
-uint64_t times[ITERS];
+__attribute__((section(".writeignored"))) uint64_t times[ITERS];
 
 void report_times()
 {
