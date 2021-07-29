@@ -43,4 +43,4 @@ remap_anon.o: remap_anon.c $(DEPS)
 	$(CC) -o $@ -c $<
 
 remap_anon: remap_anon.o pmparser.o
-	$(CC) -o $@ -no-pie -Wl,--section-start=.remap=0x13370000 remap_anon.o pmparser.o
+	$(CC) -o $@ -no-pie -Wl,--section-start=.remap=0x13370000,--section-start=.writesafe=0x13380000,--section-start=.bss=0x500000 -pthread -static remap_anon.o pmparser.o

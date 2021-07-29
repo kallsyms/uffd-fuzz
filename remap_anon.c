@@ -3,17 +3,40 @@
 #include <stdint.h>
 #include <linux/userfaultfd.h>
 #include <sys/ioctl.h>  // ioctl
+#include <pthread.h>
+#include <poll.h>
 
 #include "pmparser.h"
 
+#ifndef UFFDIO_WRITEPROTECT_MODE_WP
+#include "uffdio_wp.h"
+#endif
+
 #define PAGE_SIZE 4096
 
-void *tmpStack;
-uintptr_t oldStack;
+// mmap region where our stack can be while we remap, and where our uffd thread can live.
+__attribute__((section(".writesafe"))) uint8_t tmp_stack[0x10000];
 
-size_t n_maps = 0;
-procmaps_struct *maps = NULL;
+// old stack to pivot back after everything is remapped
+__attribute__((section(".writesafe"))) uintptr_t old_stack;
 
+// marked writesafe so that they don't get pulled out from underneath us in remap()
+__attribute__((section(".writesafe"))) size_t n_maps = 0;
+__attribute__((section(".writesafe"))) procmaps_struct maps[0x100];
+
+typedef struct {
+    uintptr_t addr;
+    uint8_t data[PAGE_SIZE];
+} page_t;
+
+__attribute__((section(".writesafe"))) size_t n_pages = 0;
+__attribute__((section(".writesafe"))) page_t pages[50];
+
+// stuff so the main thread can wait until UFFD write protecting is done
+__attribute__((section(".writesafe"))) pthread_cond_t uffd_ready = PTHREAD_COND_INITIALIZER;
+__attribute__((section(".writesafe"))) pthread_mutex_t uffd_ready_lock = PTHREAD_MUTEX_INITIALIZER;
+
+// stubs that remap() needs (since it can't touch libc while it's doing its thing)
 __attribute__((section(".remap"))) void *remap_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
     register int r10 __asm__("r10") = flags;
@@ -59,11 +82,8 @@ __attribute__((section(".remap"))) int remap_munmap(void *addr, size_t length)
 
 __attribute__((noinline, section(".remap"))) void remap()
 {
-    register size_t r_n_maps = n_maps;
-    register procmaps_struct *r_maps = maps;
-
-    for (off_t i = 0; i < r_n_maps; i++) {
-        procmaps_struct *cur_map = &r_maps[i];
+    for (off_t i = 0; i < n_maps; i++) {
+        procmaps_struct *cur_map = &maps[i];
         int prot = (cur_map->is_r ? PROT_READ : 0) | (cur_map->is_w ? PROT_WRITE : 0) | (cur_map->is_x ? PROT_EXEC : 0);
 
         // copy from region to tmp
@@ -83,9 +103,12 @@ __attribute__((noinline, section(".remap"))) void remap()
             new[j] = tmp[j];
         }
 
+        // clean up tmp
+        remap_munmap((void *)0xdead0000, cur_map->length);
+
         // re-set permissions
         remap_mprotect(cur_map->addr_start, cur_map->addr_end - cur_map->addr_start, prot);
-	}
+    }
 
     return;
 }
@@ -100,18 +123,20 @@ int load_maps()
 {
     procmaps_iterator* maps_it = pmparser_parse(-1);
 
-	if (maps == NULL) {
+    if (maps_it == NULL) {
         perror("pmparser_parse");
         return -1;
-	}
+    }
 
-	procmaps_struct* cur_map = NULL;
+    procmaps_struct* cur_map = NULL;
 
-	while ((cur_map = pmparser_next(maps_it)) != NULL) {
-        if (cur_map->addr_start == (void *)0x13370000 || cur_map->addr_start == tmpStack || cur_map->addr_start == maps) {
+    while ((cur_map = pmparser_next(maps_it)) != NULL) {
+        // ignore .remap and .writesafe
+        if (cur_map->addr_start == (void *)0x13370000 || cur_map->addr_start == (void *)0x13380000) {
             continue;
         }
 
+        // ignore --- regions (libc has a couple?)
         if (!(cur_map->is_r || cur_map->is_w || cur_map->is_x)) {
             continue;
         }
@@ -120,13 +145,21 @@ int load_maps()
             continue;
         }
 
-		pmparser_print(cur_map, 0);
+        // only monitor the program BSS
+        if (cur_map->addr_start < (void *)0x7e0000000000 && cur_map->addr_start != (void *)0x500000) {
+            continue;
+        }
+
+        // TODO: need some way to pre-fill the PLT for anything uffd_monitor_thread uses
+        // XXX: right now just building statically
+
+        pmparser_print(cur_map, 0);
 
         maps[n_maps] = *cur_map;
         n_maps++;
     }
 
-	pmparser_free(maps_it);
+    pmparser_free(maps_it);
 
     return 0;
 }
@@ -134,21 +167,170 @@ int load_maps()
 void remap_stack_swap()
 {
     asm(
-        "movq tmpStack, %%rax; addq $0x5000, %%rax; movq %%rsp, oldStack; movq %%rax, %%rsp"
+        "leaq tmp_stack, %%rax; addq $0xf000, %%rax; movq %%rsp, old_stack; movq %%rax, %%rsp"
         : // no out
         : // no in
         : "rax");
 
     remap();
 
-    asm("movq oldStack, %rsp");
+    asm("movq old_stack, %rsp");
 }
 
+void *uffd_monitor_thread(void *data)
+{
+    // swap back to tmp_stack
+    asm("leaq tmp_stack, %rsp; addq $0xf000, %rsp");
+
+    int uffd = *(int *)data;
+
+    // TODO: ignore PLT writes (probably just set the section address in the linker args)
+
+    for (off_t i = 0; i < n_maps; i++) {
+        procmaps_struct *cur_map = &maps[i];
+
+        struct uffdio_writeprotect wp = {0};
+        wp.range.start = (unsigned long)cur_map->addr_start;
+        wp.range.len = (unsigned long)cur_map->addr_end - (unsigned long)cur_map->addr_start;
+        wp.mode = UFFDIO_WRITEPROTECT_MODE_WP;
+        if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp) == -1) {
+            perror("ioctl(UFFDIO_WRITEPROTECT)");
+            _exit(1);
+        }
+    }
+
+    pthread_cond_signal(&uffd_ready);
+
+    // TODO: replace _exits with UFFD unregister, prints, exit
+
+    for (;;) {
+        struct uffd_msg msg;
+
+        struct pollfd pollfd[1];
+        pollfd[0].fd = uffd;
+        pollfd[0].events = POLLIN;
+        int pollres;
+
+        pollres = poll(pollfd, 1, -1);
+        switch (pollres) {
+            case -1:
+                // perror("poll");
+                continue;
+                break;
+            case 0: continue; break;
+            case 1: break;
+        }
+        if (pollfd[0].revents & POLLERR) {
+            // fprintf(stderr, "POLLERR on userfaultfd\n");
+            _exit(2);
+        }
+        if (!(pollfd[0].revents & POLLIN)) {
+            continue;
+        }
+
+        int readret;
+        readret = read(uffd, &msg, sizeof(msg));
+        if (readret == -1) {
+            if (errno == EAGAIN)
+                continue;
+            //perror("read userfaultfd");
+            _exit(3);
+        }
+        if (readret != sizeof(msg)) {
+            //fprintf(stderr, "short read, not expected, exiting\n");
+            _exit(4);
+        }
+
+        if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
+            // record contents
+            uintptr_t page_addr = msg.arg.pagefault.address & ~(PAGE_SIZE - 1);
+            pages[n_pages].addr = page_addr;
+            memcpy(pages[n_pages].data, (void *)page_addr, PAGE_SIZE);
+            n_pages++;
+
+            // send write unlock
+            struct uffdio_writeprotect wp;
+            wp.range.start = page_addr;
+            wp.range.len = PAGE_SIZE;
+            wp.mode = 0;
+            if (ioctl(uffd, UFFDIO_WRITEPROTECT, &wp) == -1) {
+                //perror("ioctl(UFFDIO_WRITEPROTECT)");
+                _exit(5);
+            }
+        }
+    }
+}
+
+int uffd_setup()
+{
+    int uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+
+    if (uffd < 0) {
+        perror("userfaultfd");
+        return 0;
+    }
+
+    // UFFD "handshake" with the kernel
+    struct uffdio_api uffdio_api;
+    uffdio_api.api = UFFD_API;
+    uffdio_api.features = 0;
+
+    if (ioctl(uffd, UFFDIO_API, &uffdio_api)) {
+        perror("ioctl(UFFDIO_API)");
+        return 0;
+    }
+
+    if (uffdio_api.api != UFFD_API) {
+        fprintf(stderr, "UFFDIO_API error %Lu\n", uffdio_api.api);
+        return 0;
+    }
+
+    if (!(uffdio_api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP)) {
+        fprintf(stderr, "UFFD doesn't have WP capability (kernel too old?)\n");
+        return 0;
+    }
+
+    for (off_t i = 0; i < n_maps; i++) {
+        procmaps_struct *cur_map = &maps[i];
+
+        // could check for is_w here, but might as well not in case something mprotects
+
+        struct uffdio_register uffdio_register = {0};
+        uffdio_register.range.start = (unsigned long)cur_map->addr_start;
+        uffdio_register.range.len = (unsigned long)cur_map->addr_end - (unsigned long)cur_map->addr_start;
+        uffdio_register.mode = UFFDIO_REGISTER_MODE_WP;
+
+        if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1) {
+            perror("ioctl(UFFDIO_REGISTER)");
+            return 0;
+        }
+    }
+
+    return uffd;
+}
+
+int uffd_deregister(int uffd)
+{
+    for (off_t i = 0; i < n_maps; i++) {
+        procmaps_struct *cur_map = &maps[i];
+
+        // could check for is_w here, but might as well not in case something mprotects
+
+        struct uffdio_range range = {0};
+        range.start = (unsigned long)cur_map->addr_start;
+        range.len = (unsigned long)cur_map->addr_end - (unsigned long)cur_map->addr_start;
+
+        if (ioctl(uffd, UFFDIO_UNREGISTER, &range) == -1) {
+            perror("ioctl(UFFDIO_UNREGISTER)");
+            return 1;
+        }
+    }
+
+    return 0;
+}
 
 int main()
 {
-    tmpStack = mmap((void *)0x13380000, 10 * PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
-    maps = mmap((void *)0x13390000, 10 * PAGE_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED, -1, 0);
     if (load_maps()) {
         return 1;
     }
@@ -157,41 +339,27 @@ int main()
 
     puts("Hello from the anonymous side");
 
-    int uffd = syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
-
-    if (uffd < 0) {
-        perror("userfaultfd");
-        exit(1);
-    }
-
-    struct uffdio_api uffdio_api;
-    uffdio_api.api = UFFD_API;
-    uffdio_api.features = 0;
-
-    if (ioctl(uffd, UFFDIO_API, &uffdio_api)) {
-        fprintf(stderr, "UFFDIO_API\n");
+    // Do basic UFFD setup here mainly just for error handling's sake
+    int uffd = uffd_setup();
+    if (!uffd) {
         return 1;
     }
 
-    printf("Features: 0x%llx\n", uffdio_api.features);
+    pthread_t uffd_thread;
+    pthread_create(&uffd_thread, NULL, uffd_monitor_thread, &uffd);
 
-    if (uffdio_api.api != UFFD_API) {
-        fprintf(stderr, "UFFDIO_API error %Lu\n", uffdio_api.api);
-        return 1;
-    }
+    puts("Waiting for uffd_monitor_thread");
 
-    for (off_t i = 0; i < n_maps; i++) {
-        procmaps_struct *cur_map = &maps[i];
+    pthread_mutex_lock(&uffd_ready_lock);
+    pthread_cond_wait(&uffd_ready, &uffd_ready_lock);
 
-        struct uffdio_register uffdio_register;
-        uffdio_register.range.start = (unsigned long)cur_map->addr_start;
-        uffdio_register.range.len = (unsigned long)cur_map->addr_end - (unsigned long)cur_map->addr_start;
-        uffdio_register.mode = UFFDIO_REGISTER_MODE_WP;
+    write(2, "Ok here we go\n", 14);
 
-        if (ioctl(uffd, UFFDIO_REGISTER, &uffdio_register) == -1) {
-            perror("ioctl(UFFDIO_REGISTER)");
-            exit(1);
-        }
+    char x = getchar();
+
+    printf("See %lu pages:\n", n_pages);
+    for (size_t i = 0; i < n_pages; i++) {
+        printf("  %p\n", (void *)pages[i].addr);
     }
 
     return 0;
