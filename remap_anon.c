@@ -138,22 +138,25 @@ int load_maps()
 
         // ignore --- regions (libc has a couple?)
         if (!(cur_map->is_r || cur_map->is_w || cur_map->is_x)) {
+            printf("Skipping --- region at %p-%p\n", cur_map->addr_start, cur_map->addr_end);
             continue;
         }
 
         if (!strcmp(cur_map->pathname, "[vsyscall]") || !strcmp(cur_map->pathname, "[vvar]") || !strcmp(cur_map->pathname, "[vdso]")) {
+            printf("Skipping %s region\n", cur_map->pathname);
             continue;
         }
 
         // only monitor the program BSS
-        if (cur_map->addr_start < (void *)0x7e0000000000 && cur_map->addr_start != (void *)0x500000) {
+        if (cur_map->addr_start == (void *)0x500000) {
+            printf("Skipping .got.plt at %p-%p\n", cur_map->addr_start, cur_map->addr_end);
             continue;
         }
 
+        pmparser_print(cur_map, 0);
+
         // TODO: need some way to pre-fill the PLT for anything uffd_monitor_thread uses
         // XXX: right now just building statically
-
-        pmparser_print(cur_map, 0);
 
         maps[n_maps] = *cur_map;
         n_maps++;
@@ -329,6 +332,17 @@ int uffd_deregister(int uffd)
     return 0;
 }
 
+void restore_pages()
+{
+    const char msg[] = "restoring pages...\n";
+    write(2, msg, sizeof(msg));
+
+    for (size_t i = 0; i < n_pages; i++) {
+        page_t *cur_page = &pages[i];
+        memcpy((void *)cur_page->addr, cur_page->data, PAGE_SIZE);
+    }
+}
+
 int main()
 {
     if (load_maps()) {
@@ -345,6 +359,8 @@ int main()
         return 1;
     }
 
+    int stack = 0xb;
+
     pthread_t uffd_thread;
     pthread_create(&uffd_thread, NULL, uffd_monitor_thread, &uffd);
 
@@ -355,12 +371,35 @@ int main()
 
     write(2, "Ok here we go\n", 14);
 
-    char x = getchar();
+    int *x = malloc(8);
+    *x = 1;
+
+    stack = 0xa;
+
+    printf("malloc at %p = %d\n", x, *x);
+    printf("stack at %p = %d\n", &stack, stack);
 
     printf("See %lu pages:\n", n_pages);
     for (size_t i = 0; i < n_pages; i++) {
         printf("  %p\n", (void *)pages[i].addr);
     }
+
+    // need to hop into a safe stack temporarily so the call/ret doesn't get overwritten
+    asm(
+        "leaq tmp_stack, %%rax; addq $0xff00, %%rax; movq %%rsp, old_stack; movq %%rax, %%rsp"
+        : // no out
+        : // no in
+        : "rax");
+
+    restore_pages();
+
+    asm("movq old_stack, %%rsp" ::: "memory");
+
+    printf("alloc now %p\n", x);
+    printf("stack at %p now %d\n", &stack, stack);
+
+    x = malloc(8);
+    printf("malloc 2nd time got %p\n", x);
 
     return 0;
 }
