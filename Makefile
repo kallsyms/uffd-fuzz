@@ -1,11 +1,11 @@
 DEPS = params.h bench.h
 
 .PHONY: all
-all: mini target 01_fork 02_vfork 03_fork_server 04_memcpy_restore
+all: mini target 01_fork 02_vfork 03_fork_server 04_memcpy_restore remap_anon
 
 .PHONY: clean
 clean:
-	rm -rf target 01_fork 02_vfork 03_fork_server pmparser.o 04_memcpy_restore.o 04_memcpy_restore mini mini.o 04_memcpy_restore.o pmparser.o
+	rm -rf mini mini.o target 01_fork 02_vfork 03_fork_server pmparser.o 04_memcpy_restore.o 04_memcpy_restore remap_anon.o
 
 .PHONY: test
 test: all
@@ -38,3 +38,9 @@ pmparser.o: pmparser.c
 
 04_memcpy_restore: 04_memcpy_restore.o pmparser.o
 	$(CC) -O3 -o $@ 04_memcpy_restore.o pmparser.o
+
+remap_anon.o: remap_anon.c $(DEPS)
+	$(CC) -o $@ -c $<
+
+remap_anon: remap_anon.o pmparser.o
+	$(CC) -o $@ -no-pie -Wl,--section-start=.remap=0x13370000 remap_anon.o pmparser.o

@@ -1,0 +1,6 @@
+go back to uffd wp
+thing should:
+    * fork
+    * trampoline to a new X region and stack which then duplicates all memory regions to be anonymous and sets uffd WP on them
+    * run the target
+    * send the modified page info (addr, orig) through shmem back to the parent

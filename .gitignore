@@ -4,3 +4,5 @@
 04_memcpy_restore
 mini
 target
+remap_anon
+*.o
