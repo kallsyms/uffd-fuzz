@@ -8,7 +8,7 @@ clean:
 	rm -rf mini mini.o target 01_fork 02_vfork 03_fork_server pmparser.o 04_memcpy_restore.o 04_memcpy_restore remap_anon.o
 
 .PHONY: test
-test: all
+test: target 01_fork 02_vfork 03_fork_server 04_memcpy_restore
 	./01_fork
 	./02_vfork
 	./03_fork_server

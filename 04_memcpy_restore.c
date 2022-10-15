@@ -18,12 +18,61 @@
 
 #define PAGE_SIZE 4096
 
-// mmap region where our stack can be while we remap, and where our uffd thread can live.
-__attribute__((section(".writeignored"))) uint8_t tmp_stack[0x10000];
+
+// stack for the uffd handler thread.
+__attribute__((section(".writeignored"))) uint8_t uffd_handler_stack[0x10000];
+// stack used by run() before switching to old_stack to run the target code
 __attribute__((section(".writeignored"))) uint8_t main_stack[0x10000];
 
 // old stack to pivot back after everything is remapped
 __attribute__((section(".writeignored"))) uintptr_t old_stack;
+
+// These have to be all inline asm because syscall() and anything else will hit libc
+#if defined(__x86_64__)
+#include "syscalls_x86_64.h"
+// TODO: lift "nice" C implementations here
+//#define save_old_stack() asm(                                                                  \
+        "leaq main_stack, %%rax; addq $0xf000, %%rax; movq %%rsp, old_stack; movq %%rax, %%rsp" \
+        ::: "rax")
+#define save_old_stack() do { register long sp __asm__ ("rsp"); old_stack = sp; sp = &main_stack[0xf000]; } while (0)
+//#define restore_old_stack() asm("movq old_stack, %rsp")
+#define restore_old_stack() do { register long sp __asm__("rsp") = old_stack; } while (0)
+//#define swap_old_stack() asm("xchgq old_stack, %%rsp" ::: "memory")
+#define swap_old_stack() do { register long sp __asm__("rsp"); register long tmp = old_stack; old_stack = sp; sp = tmp; } while (0)
+//#define switch_uffd_handler_stack() asm("leaq uffd_handler_stack, %rsp; addq $0xf000, %rsp")
+#define switch_uffd_handler_stack() do { register long sp __asm__("rsp") = &uffd_handler_stack[0xf000]; } while (0)
+
+#elif defined(__aarch64__)
+#include "syscalls_aarch64.h"
+// commented things _may_ work
+//#define save_old_stack() asm("ldr x0, =main_stack; add x0, x0, #0xf000; ldr x1, =old_stack; mov x2, sp; str x2, [x1]; mov sp, x0" ::: "x0", "x1", "x2")
+#define save_old_stack() do { register long sp __asm__ ("sp"); old_stack = sp; sp = &main_stack[0xf000]; } while (0)
+//#define restore_old_stack() asm("ldr x0, =old_stack; ldr x0, [x0]; mov sp, x0" ::: "x0")
+#define restore_old_stack() do { register long sp __asm__("sp") = old_stack; } while (0)
+//#define swap_old_stack() asm("ldr x0, =old_stack; ldr x1, [x0]; mov x2, sp; str x2, [x0]; mov sp, x1" ::: "x0", "x1", "x2", "memory")
+#define swap_old_stack() do { register long sp __asm__("sp"); register long tmp = old_stack; old_stack = sp; sp = tmp; } while (0)
+//#define switch_uffd_handler_stack() asm("ldr x0, =uffd_handler_stack; add x0, x0, #0xf000; mov sp, x0" ::: "x0")
+#define switch_uffd_handler_stack() do { register long sp __asm__("sp") = &uffd_handler_stack[0xf000]; } while (0)
+
+#else
+#error Unimplemented arch
+#endif
+
+__attribute__((section(".remap"))) void *remap_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
+{
+    return (void *)my_syscall6(__NR_mmap, addr, length, prot, flags, fd, offset);
+}
+
+__attribute__((section(".remap"))) int remap_mprotect(void *addr, size_t length, int prot)
+{
+    return (int)my_syscall3(__NR_mprotect, addr, length, prot);
+}
+
+__attribute__((section(".remap"))) int remap_munmap(void *addr, size_t length)
+{
+    return (int)my_syscall2(__NR_mprotect, addr, length);
+}
+
 
 // marked writeignored so that they don't get pulled out from underneath us in remap()
 __attribute__((section(".writeignored"))) size_t n_maps = 0;
@@ -40,50 +89,6 @@ __attribute__((section(".writeignored"))) page_t pages[50];
 // stuff so the main thread can wait until UFFD write protecting is done
 __attribute__((section(".writeignored"))) pthread_cond_t uffd_ready = PTHREAD_COND_INITIALIZER;
 __attribute__((section(".writeignored"))) pthread_mutex_t uffd_ready_lock = PTHREAD_MUTEX_INITIALIZER;
-
-// stubs that remap() needs (since it can't touch libc while it's doing its thing)
-__attribute__((section(".remap"))) void *remap_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
-{
-    register int r10 __asm__("r10") = flags;
-    register int r8 __asm__("r8") = fd;
-    register off_t r9 __asm__("r9") = offset;
-    
-    void *ret;
-    asm volatile
-    (
-         "syscall"
-         : "=a" (ret)
-         : "0" (__NR_mmap), "D"(addr), "S"(length), "d"(prot), "r"(r10), "r"(r8), "r"(r9)
-         : "memory", "cc", "r11", "cx"
-    );
-    return ret;
-}
-
-__attribute__((section(".remap"))) int remap_mprotect(void *addr, size_t length, int prot)
-{
-    int ret;
-    asm volatile
-    (
-         "syscall"
-         : "=a" (ret)
-         : "0" (__NR_mprotect), "D"(addr), "S"(length), "d"(prot)
-         : "memory"
-    );
-    return ret;
-}
-
-__attribute__((section(".remap"))) int remap_munmap(void *addr, size_t length)
-{
-    int ret;
-    asm volatile
-    (
-         "syscall"
-         : "=a" (ret)
-         : "0" (__NR_munmap), "D"(addr), "S"(length)
-         : "memory"
-    );
-    return ret;
-}
 
 __attribute__((noinline, section(".remap"))) void remap()
 {
@@ -176,9 +181,7 @@ int load_maps()
 
 __attribute__((noreturn)) void *uffd_monitor_thread(void *data)
 {
-    // swap back to tmp_stack
-    asm("leaq tmp_stack, %rsp; addq $0xf000, %rsp");
-
+    switch_uffd_handler_stack();
     int uffd = *(int *)data;
 
     // TODO: ignore PLT writes (probably just set the section address in the linker args)
@@ -375,9 +378,9 @@ int run()
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
 
-        asm("xchgq old_stack, %%rsp" ::: "memory");
+        swap_old_stack();
         target_main();
-        asm("xchgq old_stack, %%rsp" ::: "memory");
+        swap_old_stack();
 
         restore_pages();
 
@@ -392,13 +395,9 @@ int run()
 
 int main(int argc, char **argv)
 {
-    asm(
-        "leaq main_stack, %%rax; addq $0xf000, %%rax; movq %%rsp, old_stack; movq %%rax, %%rsp"
-        ::: "rax");
-
+    save_old_stack();
     register int ret = run();
-
-    asm("movq old_stack, %rsp");
+    restore_old_stack();
 
     return ret;
 }
