@@ -8,7 +8,7 @@
 
 #include "target.h"
 
-void run_one()
+void run_one(int argc, char **argv)
 {
     pid_t pid = fork();
     if (pid < 0) {
@@ -17,7 +17,7 @@ void run_one()
     }
     if (pid == 0) {
         // child
-        target_main();
+        target_main(argc, argv);
         _exit(1);
     } else {
         wait(NULL);
@@ -25,5 +25,5 @@ void run_one()
 }
 
 BENCH_MAIN({
-    run_one();
+    run_one(argc, argv);
 })

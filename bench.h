@@ -1,4 +1,4 @@
-#define _GNU_SOURCE    // for sched_setaffinity
+#define _GNU_SOURCE    // for sched_setaffinity and CPU_*
 
 #include <stdio.h>     // perror
 #include <unistd.h>    // fork, execve, dup, dup2
