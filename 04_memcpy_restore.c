@@ -41,10 +41,10 @@ __attribute__((section(".writeignored"))) uintptr_t target_stack;
 #error Unimplemented arch
 #endif
 
-#define save_target_stack_and_pivot() do { register long sp __asm__ (SP_REG); target_stack = sp; sp = (long)&loop_stack[0xf000]; asm volatile ("" ::: "memory" );} while (0)
-#define restore_target_stack() do { register long sp __asm__(SP_REG) = target_stack; asm volatile ("" ::: "memory" ); } while (0)
-#define swap_target_stack() do { register long sp __asm__(SP_REG); register long tmp = target_stack; target_stack = sp; sp = tmp; asm volatile ("" ::: "memory" ); } while (0)
-#define switch_uffd_handler_stack() do { register long sp __asm__(SP_REG) = (long)&uffd_handler_stack[0xf000]; asm volatile ("" ::: "memory" ); } while (0)
+#define save_target_stack_and_pivot() do { volatile register long sp __asm__ (SP_REG); target_stack = sp; sp = (long)&loop_stack[0xf000]; asm volatile ("" ::: "memory" );} while (0)
+#define restore_target_stack() do { volatile register long sp __asm__(SP_REG) = target_stack; asm volatile ("" ::: "memory" ); } while (0)
+#define swap_target_stack() do { volatile register long sp __asm__(SP_REG); register long tmp = target_stack; target_stack = sp; sp = tmp; asm volatile ("" ::: "memory" ); } while (0)
+#define switch_uffd_handler_stack() do { volatile register long sp __asm__(SP_REG) = (long)&uffd_handler_stack[0xf000]; asm volatile ("" ::: "memory" ); } while (0)
 
 
 __attribute__((section(".remap"))) void *remap_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
