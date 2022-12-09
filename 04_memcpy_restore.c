@@ -30,10 +30,10 @@ __attribute__((section(".writeignored"))) uintptr_t old_stack;
 // These have to be all inline asm because syscall() and anything else will hit libc
 #if defined(__x86_64__)
 #include "syscalls_x86_64.h"
-#define save_old_stack() do { register long sp __asm__ ("rsp"); old_stack = sp; sp = (long)&main_stack[0xf000]; } while (0)
-#define restore_old_stack() do { register long sp __asm__("rsp") = old_stack; } while (0)
-#define swap_old_stack() do { register long sp __asm__("rsp"); register long tmp = old_stack; old_stack = sp; sp = tmp; } while (0)
-#define switch_uffd_handler_stack() do { register long sp __asm__("rsp") = (long)&uffd_handler_stack[0xf000]; } while (0)
+#define save_old_stack() do { register long sp __asm__ ("rsp"); old_stack = sp; sp = (long)&main_stack[0xf000]; asm volatile ("" ::: "memory" );} while (0)
+#define restore_old_stack() do { register long sp __asm__("rsp") = old_stack; asm volatile ("" ::: "memory" ); } while (0)
+#define swap_old_stack() do { register long sp __asm__("rsp"); register long tmp = old_stack; old_stack = sp; sp = tmp; asm volatile ("" ::: "memory" ); } while (0)
+#define switch_uffd_handler_stack() do { register long sp __asm__("rsp") = (long)&uffd_handler_stack[0xf000]; asm volatile ("" ::: "memory" ); } while (0)
 
 #elif defined(__aarch64__)
 #error JK aarch64 doesnt have USERFAULTFD_WP support
@@ -64,7 +64,7 @@ __attribute__((section(".remap"))) int remap_mprotect(void *addr, size_t length,
 
 __attribute__((section(".remap"))) int remap_munmap(void *addr, size_t length)
 {
-    return (int)my_syscall2(__NR_mprotect, addr, length);
+    return (int)my_syscall2(__NR_munmap, addr, length);
 }
 
 
