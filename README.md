@@ -1,6 +1,6 @@
 **WARNING: Super proof of concept code.**
 
-See also: [libjpeg-turbo modified with this concept](https://github.com/kallsyms/uffd-fuzz-libjpeg-turbo)
+See also: [libjpeg-turbo modified with this concept](https://github.com/kallsyms/uffd-fuzz-libjpeg-turbo/tree/04_memcpy_restore)
 
 # Basic outline
 * `01_fork`: basic fork server for benchmarking against
