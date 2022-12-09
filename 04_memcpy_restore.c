@@ -21,36 +21,31 @@
 
 // stack for the uffd handler thread.
 __attribute__((section(".writeignored"))) uint8_t uffd_handler_stack[0x10000];
-// stack used by run() before switching to old_stack to run the target code
-__attribute__((section(".writeignored"))) uint8_t main_stack[0x10000];
+// stack used by run() before switching to target_stack to run the target code
+__attribute__((section(".writeignored"))) uint8_t loop_stack[0x10000];
 
-// old stack to pivot back after everything is remapped
-__attribute__((section(".writeignored"))) uintptr_t old_stack;
+// the stack that this program was started with, which will be pivoted back to to run the target
+__attribute__((section(".writeignored"))) uintptr_t target_stack;
 
-// These have to be all inline asm because syscall() and anything else will hit libc
 #if defined(__x86_64__)
+// These have to be all inline asm because syscall() and anything else will hit libc
 #include "syscalls_x86_64.h"
-#define save_old_stack() do { register long sp __asm__ ("rsp"); old_stack = sp; sp = (long)&main_stack[0xf000]; asm volatile ("" ::: "memory" );} while (0)
-#define restore_old_stack() do { register long sp __asm__("rsp") = old_stack; asm volatile ("" ::: "memory" ); } while (0)
-#define swap_old_stack() do { register long sp __asm__("rsp"); register long tmp = old_stack; old_stack = sp; sp = tmp; asm volatile ("" ::: "memory" ); } while (0)
-#define switch_uffd_handler_stack() do { register long sp __asm__("rsp") = (long)&uffd_handler_stack[0xf000]; asm volatile ("" ::: "memory" ); } while (0)
+#define SP_REG "rsp"
 
 #elif defined(__aarch64__)
 #error JK aarch64 doesnt have USERFAULTFD_WP support
 #include "syscalls_aarch64.h"
-// commented things _may_ work
-//#define save_old_stack() asm("ldr x0, =main_stack; add x0, x0, #0xf000; ldr x1, =old_stack; mov x2, sp; str x2, [x1]; mov sp, x0" ::: "x0", "x1", "x2")
-#define save_old_stack() do { register long sp __asm__ ("sp"); old_stack = sp; sp = (long)&main_stack[0xf000]; } while (0)
-//#define restore_old_stack() asm("ldr x0, =old_stack; ldr x0, [x0]; mov sp, x0" ::: "x0")
-#define restore_old_stack() do { register long sp __asm__("sp") = old_stack; } while (0)
-//#define swap_old_stack() asm("ldr x0, =old_stack; ldr x1, [x0]; mov x2, sp; str x2, [x0]; mov sp, x1" ::: "x0", "x1", "x2", "memory")
-#define swap_old_stack() do { register long sp __asm__("sp"); register long tmp = old_stack; old_stack = sp; sp = tmp; } while (0)
-//#define switch_uffd_handler_stack() asm("ldr x0, =uffd_handler_stack; add x0, x0, #0xf000; mov sp, x0" ::: "x0")
-#define switch_uffd_handler_stack() do { register long sp __asm__("sp") = (long)&uffd_handler_stack[0xf000]; } while (0)
+#define SP_REG "sp"
 
 #else
 #error Unimplemented arch
 #endif
+
+#define save_target_stack_and_pivot() do { register long sp __asm__ (SP_REG); target_stack = sp; sp = (long)&loop_stack[0xf000]; asm volatile ("" ::: "memory" );} while (0)
+#define restore_target_stack() do { register long sp __asm__(SP_REG) = target_stack; asm volatile ("" ::: "memory" ); } while (0)
+#define swap_target_stack() do { register long sp __asm__(SP_REG); register long tmp = target_stack; target_stack = sp; sp = tmp; asm volatile ("" ::: "memory" ); } while (0)
+#define switch_uffd_handler_stack() do { register long sp __asm__(SP_REG) = (long)&uffd_handler_stack[0xf000]; asm volatile ("" ::: "memory" ); } while (0)
+
 
 __attribute__((section(".remap"))) void *remap_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset)
 {
@@ -184,7 +179,7 @@ int load_maps()
     return 0;
 }
 
-__attribute__((noreturn)) void *uffd_monitor_thread(void *data)
+void *uffd_monitor_thread(void *data)
 {
     switch_uffd_handler_stack();
     int uffd = *(int *)data;
@@ -221,8 +216,7 @@ __attribute__((noreturn)) void *uffd_monitor_thread(void *data)
             case -1:
                 // perror("poll");
                 continue;
-                break;
-            case 0: continue; break;
+            case 0: continue;
             case 1: break;
         }
         if (pollfd[0].revents & POLLERR) {
@@ -350,21 +344,15 @@ void restore_pages()
     }
 }
 
-int main(int _argc, char **_argv)
+__attribute__((noinline)) int nowrite_main(int argc, char **argv)
 {
-    // not sure if necessary, but pin to register so stack swapping doesn't do anything bad if these spill
-    register int argc = _argc;
-    register char **argv = _argv;
-
-    save_old_stack();
-
+    // Now in the "safe" stack which won't be write monitored
     if (load_maps()) {
         return 1;
     }
 
     remap();
 
-    // Do basic UFFD setup here mainly just for error handling's sake
     int uffd = uffd_setup();
     if (!uffd) {
         return 1;
@@ -384,9 +372,9 @@ int main(int _argc, char **_argv)
         struct timespec start, end;
         clock_gettime(CLOCK_MONOTONIC, &start);
 
-        swap_old_stack();
+        swap_target_stack();
         target_main(argc, argv);
-        swap_old_stack();
+        swap_target_stack();
 
         restore_pages();
 
@@ -397,7 +385,16 @@ int main(int _argc, char **_argv)
     dup2(stdout_fd, STDOUT_FILENO);
     report_times();
 
-    restore_old_stack();
-
     return 0;
+}
+
+int main(int argc, char **argv)
+{
+    // pivot only saves rsp, so go another function deep so rbp relative stack vars are also on the writeignored stack.
+    save_target_stack_and_pivot();
+
+    nowrite_main(argc, argv);
+
+    // Restore before returning so that parent stack frames are where they're expected
+    restore_target_stack();
 }

@@ -2,5 +2,5 @@
 
 int main(int argc, char **argv)
 {
-    return target_main();
+    return target_main(argc, argv);
 }
